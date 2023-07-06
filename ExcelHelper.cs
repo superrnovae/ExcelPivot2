@@ -6,25 +6,53 @@ using NPOI.XSSF.UserModel;
 
 namespace ConsoleApp4.Excel
 {
-    public static class ExcelHelper
+   internal readonly struct DataFormats
     {
-        private static readonly Dictionary<Type, Action<ICell, object>> cellFormatMapper = new()
+        public const string TEXT = "@";
+        public const string GENERAL = "General";
+        public const string INTEGER = "#,##0";
+        public const string FLOATING = "#,##0.00";
+        public const string DATE = "d-mmm-yy";
+        public const string DATETIME = "d-mmm-yy h:mm:ss";
+    }
+
+    public class ExcelHelper
+    {
+        private readonly Dictionary<Type, Action<ICell, IDataFormat, object>> _cellValueSetMapper = new()
         {
-            { typeof(int), (ICell cell, object value) =>  cell.SetCellValue((int) value) },
-            { typeof(double), (ICell cell, object value) => cell.SetCellValue((double) value) },
-            { typeof(DateTime), (ICell cell, object value) => cell.SetCellValue((DateTime) value)},
-            { typeof(string), (ICell cell, object value) => cell.SetCellValue((string) value) },
-            { typeof(decimal), (ICell cell, object value) => cell.SetCellValue(decimal.ToDouble((decimal) value)) },
-            { typeof(bool), (ICell cell, object value) => cell.SetCellValue((bool) value) },
-            { typeof(byte), (ICell cell, object value) => cell.SetCellValue(Convert.ToDouble((byte) value)) },
-            { typeof(ushort), (ICell cell, object value) => cell.SetCellValue(Convert.ToDouble((ushort) value)) },
-            { typeof(short), (ICell cell, object value) => cell.SetCellValue(Convert.ToDouble((short) value)) },
-            { typeof(long), (ICell cell, object value) => cell.SetCellValue(Convert.ToDouble((long) value)) },
-            { typeof(char), (ICell cell, object value) => cell.SetCellValue(((char) value).ToString()) },
-            { typeof(float), (ICell cell, object value) => cell.SetCellValue(Convert.ToDouble((float) value)) },
-            { typeof(Guid), (ICell cell, object value) => cell.SetCellValue(((Guid) value).ToString()) },
-            { typeof(object), (ICell cell, object value) => cell.SetCellValue(value.ToString()) }
+            { typeof(int), (c, df, v) =>  SetValueAndFormat(c, df, (int) v) },
+            { typeof(double), (c, df, v) => SetValueAndFormat(c, df, (double) v) },
+            { typeof(DateTime), (c, df, v) => SetValueAndFormat(c, df, (DateTime) v)},
+            { typeof(string), (c, df, v) => SetValueAndFormat(c, df, (string) v) },
+            { typeof(decimal), (c, df, v) => SetValueAndFormat(c, df, decimal.ToDouble((decimal) v)) },
+            { typeof(bool), (c, df, v) => SetValueAndFormat(c, df, (bool) v) },
+            { typeof(byte), (c, df, v) => SetValueAndFormat(c, df, (byte) v) },
+            { typeof(short), (c, df, v) => SetValueAndFormat(c, df, (short) v) },
+            { typeof(long), (c, df, v) => SetValueAndFormat(c, df, Convert.ToDouble((long) v)) },
+            { typeof(char), (c, df, v) => SetValueAndFormat(c, df, ((char) v).ToString()) },
+            { typeof(float), (c, df, v) => SetValueAndFormat(c, df, (float) v) },
+            { typeof(Guid), (c, df, v) => SetValueAndFormat(c, df, ((Guid) v).ToString()) },
+            { typeof(object), (c, df, v) => SetValueAndFormat(c, df, v.ToString()) }
         };
+
+        private static Dictionary<Type, ICellStyle> _cellStyleCache;
+
+        private static readonly IDictionary<Type, string> _cellFormatMapper = new Dictionary<Type, string>() {
+            { typeof(double), DataFormats.FLOATING},
+            { typeof(byte), DataFormats.INTEGER },
+            { typeof(int), DataFormats.INTEGER },
+            { typeof(float), DataFormats.FLOATING },
+            { typeof(decimal), DataFormats.FLOATING },
+            { typeof(short), DataFormats.INTEGER },
+            { typeof(long), DataFormats.INTEGER },
+            { typeof(char), DataFormats.TEXT },
+            { typeof(string), DataFormats.TEXT },
+            { typeof(Guid), DataFormats.TEXT },
+            { typeof(DateTime), DataFormats.DATE },
+            { typeof(object), DataFormats.TEXT },
+        };
+
+        public static IDictionary<Type, string> DataFormatMapping { get; set; }
 
         /// <summary>
         /// Writes an <see cref="IEnumerable{T}"/> into a stream, 
@@ -38,50 +66,32 @@ namespace ConsoleApp4.Excel
         /// <param name="settings"></param>
         /// <param name="leaveOpen"></param>
         /// <exception cref="ArgumentNullException"></exception>
-        public static void WriteToExcelTable<T>(Stream stream, IEnumerable<T> objects, string[] ignoredColumns = null, PivotSettings pivotSettings = null, bool leaveOpen = false)
+        public void Write<T>(Stream stream, IEnumerable<T> objects, bool leaveOpen = false, params string[] members)
         {
             if (stream == null) throw new ArgumentNullException(nameof(stream));
             if (objects == null) throw new ArgumentNullException(nameof(objects));
 
             // Uses object reader to itterate over the columns of the records
-            using var reader = ObjectReader.Create(objects);
-            List<TableColumn> columns = GetVisibleColumns(reader, ignoredColumns).ToList();
+            using var reader = ObjectReader.Create(objects, members);
+            IList<TableColumn> columns = GetVisibleColumns(reader).ToList();
 
-            if (!columns.Any())
+            if (columns.Count == 0)
                 throw new InvalidOperationException("There are no writable columns");
-
-            UpdateColumnWidths(columns);
 
             // Create Worksheet
             using IWorkbook workbook = new XSSFWorkbook();
             XSSFSheet sheet = (XSSFSheet)workbook.CreateSheet("DATA");
 
-            // Create table
-            XSSFTable table = CreateTable(sheet, columns);
+            _cellStyleCache = new();
+
+            // Write data
             int rowCount = FillData(sheet, reader, columns);
+
+            // Create table
+            XSSFTable table = CreateTable(sheet, columns, rowCount);
 
             // Manually auto size columns, is way faster than sheet's AutoSizeColumn() method
             ResizeColumns(sheet, columns);
-
-            // Update table's referenced area
-            // see bug: https://github.com/nissl-lab/npoi/issues/1026
-            // also see: https://github.com/nissl-lab/npoi/pull/1035
-            AreaReference dataRange = new(new CellReference(0, 0), new CellReference(rowCount - 1, columns.Count - 1));
-            table.SetCellReferences(dataRange);
-
-            // Add column filters
-            table.GetCTTable().autoFilter = new()
-            {
-                @ref = dataRange.FormatAsString()
-            };
-
-            // Create pivot table
-            if (pivotSettings != null)
-            {
-                XSSFPivotTable pivotTable = PivotHelper.CreatePivotTable(table, pivotSettings);
-                sheet.IsSelected = false;
-                workbook.SetActiveSheet(workbook.GetSheetIndex(pivotTable.GetParentSheet().SheetName));
-            }
 
             // write book to the stream
             workbook.Write(stream, leaveOpen);
@@ -94,7 +104,7 @@ namespace ConsoleApp4.Excel
         /// <param name="sheet"></param>
         /// <param name="columns"></param>
         /// <returns>An instance of <see cref="XSSFTable"/></returns>
-        private static XSSFTable CreateTable(XSSFSheet sheet, IList<TableColumn> columns)
+        private static XSSFTable CreateTable(XSSFSheet sheet, IList<TableColumn> columns, int rowCount)
         {
             XSSFTable xssfTable = sheet.CreateTable();
 
@@ -103,9 +113,8 @@ namespace ConsoleApp4.Excel
             xssfTable.IsHasTotalsRow = false;
             xssfTable.DisplayName = "MYTABLE";
 
-            // see bug: https://github.com/nissl-lab/npoi/issues/1026
-            // also see: https://github.com/nissl-lab/npoi/pull/1035
-            xssfTable.SetCellReferences(new AreaReference(new CellReference(0, 0), new CellReference(1, 1), SpreadsheetVersion.EXCEL2007));
+            var tableRange = new AreaReference(new CellReference(0, 0), new CellReference(rowCount - 1, columns.Count - 1));
+            xssfTable.SetCellReferences(tableRange);
 
             xssfTable.StyleName = XSSFBuiltinTableStyleEnum.TableStyleMedium16.ToString();
             xssfTable.Style.IsShowColumnStripes = false;
@@ -115,6 +124,12 @@ namespace ConsoleApp4.Excel
             {
                 xssfTable.CreateColumn(columns[i].Name, i);
             }
+
+            // Add column filters
+            xssfTable.GetCTTable().autoFilter = new()
+            {
+                @ref = tableRange.FormatAsString()
+            };
 
             return xssfTable;
         }
@@ -128,89 +143,87 @@ namespace ConsoleApp4.Excel
         /// <param name="columns"></param>
         /// <param name="colWidths"></param>
         /// <returns></returns>
-        private static int FillData(XSSFSheet sheet, ObjectReader reader, IList<TableColumn> columns)
+        private int FillData(XSSFSheet sheet, ObjectReader reader, IList<TableColumn> columns)
         {
+            IDataFormat dataFormat = sheet.Workbook.CreateDataFormat();
+
             // fill the header row
             IRow headerRow = sheet.CreateRow(0);
 
-            foreach (TableColumn c in columns)
+            for (int i=0; i < columns.Count; i++)
             {
-                var cell = headerRow.CreateCell(c.Index);
-                cell.SetCellValue(c.Name);
+                var cell = headerRow.CreateCell(i);
+                cell.SetCellValue(columns[i].Name);
             }
 
             // populate values
-            int index = 1;
-            object[] values = new object[columns.Count];
+            int rowCount = 1;
 
             while (reader.Read())
             {
-                var row = sheet.CreateRow(index);
-                int instances = reader.GetValues(values);
+                var row = sheet.CreateRow(rowCount);
 
-                for (int j = 0; j < instances; j++)
+                for (int i = 0; i < reader.FieldCount; i++)
                 {
-                    ICell cell = row.CreateCell(j);
+                    ICell cell = row.CreateCell(i);
 
                     // invoke setvalue method with respective type based on type of the boxed object
-                    object value = values[j];
-                    cellFormatMapper[value.GetType()].Invoke(cell, value);
+                    object value = reader.GetValue(i);
+                    var setCellValueFunc = _cellValueSetMapper[value.GetType()];
+                    setCellValueFunc(cell, dataFormat, value);
 
                     //compare lengths
                     int length = value.ToString().Length;
 
-                    if (columns[j].Width < length)
+                    if (columns[i].Width < length)
                     {
-                        columns[j].Width = length + 2;
+                        columns[i].Width = length + 2;
                     }
                 }
-                index++;
+                rowCount++;
             }
 
-            return index;
+            return rowCount;
         }
 
-        private static IEnumerable<TableColumn> GetVisibleColumns(ObjectReader reader, string[] ignoredColumns = null)
+        private static IList<TableColumn> GetVisibleColumns(ObjectReader reader, params string[] members)
         {
-            string[] readerColumns = new string[reader.FieldCount];
+            var tableColumns = new List<TableColumn>();
 
-            for (int i = 0; i < reader.FieldCount; i++)
+            if (reader.FieldCount == 0)
+                return tableColumns;
+
+            if(members.Length > 0)
             {
-                readerColumns[i] = reader.GetName(i);
-            }
-
-            ignoredColumns ??= Array.Empty<string>();
-
-            IEnumerable<string> visibleColumns = readerColumns.Except(ignoredColumns);
-
-            int index = 0;
-
-            foreach (var col in visibleColumns)
-            {
-                yield return new TableColumn()
+                foreach (var column in members)
                 {
-                    Name = col,
-                    Index = index++,
-                    Width = 0
-                };
+                    if (reader.GetOrdinal(column) != -1)
+                    {
+                        tableColumns.Add(new TableColumn()
+                        {
+                            Name = column,
+                            Width = column.Length + 4
+                        });
+                    }
+                }
             }
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="reader"></param>
-        /// <param name="columns"></param>
-        /// <param name="resArray"></param>
-        private static void UpdateColumnWidths(IEnumerable<TableColumn> columns)
-        {
-            foreach(TableColumn c in columns)
+            else
             {
-                int length = c.Name.Length;
+                for(int i=0; i<reader.FieldCount; i++)
+                {
+                    string colName = reader.GetName(i);
 
-                if (c.Width < length)
-                    c.Width = length + 4;
+                    tableColumns.Add(new TableColumn()
+                    {
+                        Name = colName,
+                        Width = colName.Length + 4
+                    });
+                }
             }
+
+            
+
+            return tableColumns;
         }
 
         /// <summary>
@@ -221,17 +234,76 @@ namespace ConsoleApp4.Excel
         /// <param name="colWidths"></param>
         private static void ResizeColumns(XSSFSheet sheet, IList<TableColumn> columns)
         {
-            for(int i=0; i<columns.Count; i++)
+            for (int i = 0; i < columns.Count; i++)
             {
-                int width = (int) (columns[i].Width  * 1.25f) * 256; // floating value can be adjusted at any time
+                int width = (int)(columns[i].Width * 1.25f) * 256; // floating value can be adjusted at any time
                 sheet.SetColumnWidth(i, Math.Min(width, 65279));
             }
+        }
+
+        private static void SetValueAndFormat(ICell cell, IDataFormat format, bool value)
+        {
+            cell.SetCellValue(value);
+            SetCellStyle(cell, format, typeof(bool));
+        }
+
+        private static void SetValueAndFormat(ICell cell, IDataFormat format, double value)
+        {
+            cell.SetCellValue(value);
+            SetCellStyle(cell, format, typeof(double));
+        }
+
+        private static void SetValueAndFormat(ICell cell, IDataFormat format, DateTime value)
+        {
+            cell.SetCellValue(value);
+            SetCellStyle(cell, format, typeof(DateTime));
+        }
+
+        private static void SetValueAndFormat(ICell cell, IDataFormat format, string value)
+        {
+            cell.SetCellValue(value);
+            SetCellStyle(cell, format, typeof(string));
+        }
+
+        private static void SetCellStyle(ICell cell, IDataFormat format, Type type)
+        {
+            ICellStyle cellStyle;
+
+            if (_cellStyleCache.ContainsKey(type))
+            {
+                cellStyle = _cellStyleCache[type];
+            }
+            else
+            {
+                cellStyle = cell.Sheet.Workbook.CreateCellStyle();
+
+                if (_cellFormatMapper.TryGetValue(type, out string formatString))
+                {
+                    short index = HSSFDataFormat.GetBuiltinFormat(formatString);
+
+                    if (index != -1)
+                    {
+                        cellStyle.DataFormat = index;
+                    }
+                    else
+                    {
+                        cellStyle.DataFormat = format.GetFormat(formatString);
+                    }
+                }
+                else
+                {
+                    cellStyle.DataFormat = format.GetFormat(DataFormats.TEXT);
+                }
+
+                _cellStyleCache.Add(type, cellStyle);
+            }
+
+            cell.CellStyle = cellStyle;
         }
     }
 
     internal class TableColumn
     {
-        public int Index { get; set; }
         public string Name { get; set; }
         public int Width { get; set; }
     }
